@@ -1,9 +1,11 @@
 package krakenapi
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/sha512"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -15,6 +17,13 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"net/http/httputil"
+
+	_ "github.com/ziutek/mymysql/godrv"
+	gorp "gopkg.in/gorp.v2"
+
+	_ "github.com/ziutek/mymysql/native" // Native engine
 )
 
 const (
@@ -23,7 +32,7 @@ const (
 	// APIVersion is the official Kraken API Version Number
 	APIVersion = "0"
 	// APIUserAgent identifies this library with the Kraken API
-	APIUserAgent = "Kraken GO API Agent (https://github.com/beldur/kraken-go-api-client)"
+	APIUserAgent = "Kraken GO API Agent (https://github.com/benduncan/kraken-go-api-client)"
 )
 
 // List of valid public methods
@@ -91,8 +100,31 @@ type KrakenApi struct {
 	client *http.Client
 }
 
+// DB Log for client<>server audit trail
+type HTTPLog struct {
+	TransactionID int64
+	QueryURL      string
+	QueryHeaders  []byte
+	QueryDate     time.Time
+	ResponseBody  []byte
+	ResponseCode  int
+	ResponseDate  time.Time
+	ID            int64
+}
+
+// DB logging for an audit trail
+var DBIuri string
+var verboseLogging bool
+
 // New creates a new Kraken API client
-func New(key, secret string) *KrakenApi {
+func New(key, secret, dbi string) *KrakenApi {
+
+	// Check to enable DB logging as an audit trail for client<>server comms
+	if dbi != "" {
+		DBIuri = dbi
+		verboseLogging = true
+	}
+
 	return NewWithClient(key, secret, http.DefaultClient)
 }
 
@@ -419,6 +451,57 @@ func (api *KrakenApi) doRequest(reqURL string, values url.Values, headers map[st
 		return nil, fmt.Errorf("Could not execute request! #2 (%s)", err.Error())
 	}
 	defer resp.Body.Close()
+
+	// AUDIT LOGGING
+	// Response success? Log it
+	if verboseLogging == true {
+		rawLog := HTTPLog{}
+
+		db, err := sql.Open("mymysql", DBIuri)
+
+		// DB error? Panic
+		if err != nil {
+			panic(err)
+		}
+
+		// Connect to the DB and provision the DB table if missing
+		dbmap := gorp.DbMap{Db: db, Dialect: gorp.MySQLDialect{"InnoDB", "UTF8"}}
+		// TODO: Remove, admin must create schema manually
+		dbmap.AddTableWithName(HTTPLog{}, "HTTPLog").SetKeys(true, "ID")
+
+		rawLog.QueryURL = req.URL.String()
+		rawLog.QueryDate = time.Now()
+
+		rawLog.QueryHeaders, _ = httputil.DumpRequest(req, false)
+
+		rawLog.ResponseCode = resp.StatusCode
+
+		// Duplicate the body content, since ioutil.ReadAll is one-time only, and we need to replace it for the json decoder to function
+		var bodyBytes []byte
+
+		if resp.Body != nil {
+			bodyBytes, _ = ioutil.ReadAll(resp.Body)
+		}
+
+		// Restore the io.ReadCloser to its original state
+		resp.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
+
+		// Log the raw body
+		rawLog.ResponseBody = bodyBytes
+
+		// Log the response time
+		rawLog.ResponseDate = time.Now()
+
+		err2 := dbmap.Insert(&rawLog)
+
+		if err2 != nil {
+			fmt.Println("Error inserting into DB =>", err2)
+		}
+
+		defer dbmap.Db.Close()
+
+	}
+	// END AUDIT LOGGING
 
 	// Read request
 	body, err := ioutil.ReadAll(resp.Body)
