@@ -33,6 +33,9 @@ const (
 	APIVersion = "0"
 	// APIUserAgent identifies this library with the Kraken API
 	APIUserAgent = "Kraken GO API Agent (https://github.com/benduncan/kraken-go-api-client)"
+
+	NumOfRetries = 60
+	SleepSeconds = 60
 )
 
 // List of valid public methods
@@ -169,6 +172,19 @@ func (api *KrakenApi) Ticker(pairs ...string) (*TickerResponse, error) {
 	}, &TickerResponse{})
 	if err != nil {
 		return nil, err
+	}
+
+	// retry loop in case of errors or empty result
+	for retries := 0; retries < NumOfRetries; retries++ {
+		if err == nil && resp != nil {
+			break
+		}
+
+		resp, err = api.queryPublic("Ticker", url.Values{
+			"pair": {strings.Join(pairs, ",")},
+		}, &TickerResponse{})
+
+		time.Sleep(SleepSeconds * time.Second)
 	}
 
 	return resp.(*TickerResponse), nil
@@ -377,6 +393,16 @@ func (api *KrakenApi) AddOrder(pair string, direction string, orderType string, 
 		params.Add("trading_agreement", value)
 	}
 	resp, err := api.queryPrivate("AddOrder", params, &AddOrderResponse{})
+
+	for retries := 0; retries < NumOfRetries; retries++ {
+
+		if err == nil {
+			break
+		}
+		time.Sleep(SleepSeconds * time.Second)
+		resp, err = api.queryPrivate("AddOrder", params, &AddOrderResponse{})
+
+	}
 
 	if err != nil {
 		return nil, err
